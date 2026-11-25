@@ -5,8 +5,11 @@ use probe_rs::probe::list::Lister;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::args().nth(1).as_deref() == Some("list") {
+        let filter = std::env::args()
+            .nth(2)
+            .unwrap_or_else(|| "STM32".to_string());
         let registry = Registry::from_builtin_families();
-        for target in registry.search_chips("STM32H743") {
+        for target in registry.search_chips(&filter) {
             println!("{target}");
         }
         return Ok(());

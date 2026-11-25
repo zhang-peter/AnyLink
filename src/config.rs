@@ -12,10 +12,14 @@ pub struct AppConfig {
     pub last_target: String,
     #[serde(default)]
     pub last_hex: Option<PathBuf>,
+    #[serde(default)]
+    pub last_hex_dir: Option<PathBuf>,
     #[serde(default = "default_verify")]
     pub verify: bool,
     #[serde(default)]
     pub chip_erase: bool,
+    #[serde(default = "default_reset_after_flash")]
+    pub reset_after_flash: bool,
 }
 
 impl Default for AppConfig {
@@ -24,13 +28,19 @@ impl Default for AppConfig {
             last_probe: None,
             last_target: String::new(),
             last_hex: None,
+            last_hex_dir: None,
             verify: true,
             chip_erase: false,
+            reset_after_flash: true,
         }
     }
 }
 
 fn default_verify() -> bool {
+    true
+}
+
+fn default_reset_after_flash() -> bool {
     true
 }
 
@@ -81,6 +91,25 @@ mod tests {
         assert_eq!(config, AppConfig::default());
         assert!(config.verify);
         assert!(!config.chip_erase);
+        assert!(config.reset_after_flash);
+    }
+
+    #[test]
+    fn old_config_without_new_reset_setting_defaults_to_run() {
+        let path = std::env::temp_dir().join(format!(
+            "anylink-old-config-test-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r#"{"last_target":"STM32G491RE","verify":true,"chip_erase":false}"#,
+        )
+        .expect("write old config");
+
+        let config = load_config_from(&path);
+        assert!(config.reset_after_flash);
+        assert_eq!(config.last_target, "STM32G491RE");
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -96,8 +125,10 @@ mod tests {
             }),
             last_target: "STM32H743ZI".to_string(),
             last_hex: Some(PathBuf::from("C:/firmware/demo.hex")),
+            last_hex_dir: Some(PathBuf::from("C:/firmware")),
             verify: false,
             chip_erase: true,
+            reset_after_flash: true,
         };
 
         save_config_to(&path, &config).expect("write config");

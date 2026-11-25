@@ -9,7 +9,7 @@ use probe_rs::Session;
 use probe_rs::config::Registry;
 use probe_rs::flashing::{
     DownloadOptions, FileDownloadError, FlashLoader, FlashProgress, ImageLoader, ImageReader,
-    build_loader,
+    build_loader, erase_all,
 };
 use probe_rs::probe::cmsisdap::CmsisDapFactory;
 use probe_rs::probe::list::Lister;
@@ -107,6 +107,13 @@ pub struct FlashRequest {
     pub hex_path: PathBuf,
     pub verify: bool,
     pub chip_erase: bool,
+    pub reset_after_flash: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct EraseRequest {
+    pub probe: ProbeKey,
+    pub target: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -170,8 +177,15 @@ pub struct FlashOutcome {
     pub file_size: u64,
     pub verified: bool,
     pub chip_erase: bool,
+    pub reset_after_flash: bool,
     pub elapsed: Duration,
     pub dry_run: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct EraseOutcome {
+    pub target: String,
+    pub elapsed: Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -608,12 +622,29 @@ pub fn flash_hex(
     })?;
 
     let verified = request.verify && !dry_run;
+    let mut reset_after_flash = false;
+
+    if request.reset_after_flash && !dry_run {
+        emit(FlashEvent::Log(
+            "下载完成，正在复位目标并开始运行……".to_string(),
+        ));
+        let mut core = session
+            .core(0)
+            .map_err(|error| format!("固件已写入并校验，但无法访问目标核心：{error}"))?;
+        core.reset().map_err(|error| {
+            format!("固件已写入并校验，但复位运行失败：{error}\n目标可能仍处于暂停状态。")
+        })?;
+        reset_after_flash = true;
+    }
+
     emit(FlashEvent::Log(if dry_run {
         "DRY RUN 完成，未修改目标 Flash。".to_string()
+    } else if reset_after_flash {
+        "固件写入并校验完成，目标已复位运行。".to_string()
     } else if verified {
-        "固件写入并校验完成。".to_string()
+        "固件写入并校验完成，目标保持暂停。".to_string()
     } else {
-        "固件写入完成（未启用校验）。".to_string()
+        "固件写入完成（未启用校验），目标保持暂停。".to_string()
     }));
 
     Ok(FlashOutcome {
@@ -622,8 +653,56 @@ pub fn flash_hex(
         file_size,
         verified,
         chip_erase: request.chip_erase,
+        reset_after_flash,
         elapsed: started.elapsed(),
         dry_run,
+    })
+}
+
+pub fn erase_chip(
+    request: &EraseRequest,
+    emit: &mut impl FnMut(FlashEvent),
+) -> Result<EraseOutcome, String> {
+    let started = Instant::now();
+    let target = resolve_target(&request.target)?;
+    emit(FlashEvent::Log(format!("目标芯片：{target}")));
+
+    let probe = open_selected_probe(&request.probe)?;
+    emit(FlashEvent::Log(format!(
+        "已打开调试器（{:04X}:{:04X}）",
+        request.probe.vendor_id, request.probe.product_id
+    )));
+
+    let mut session = attach(probe, &target)?;
+    let attached_target = session.target().name.clone();
+    emit(FlashEvent::Log(format!(
+        "已连接目标：{attached_target} / {:?}",
+        session.architecture()
+    )));
+    emit(FlashEvent::Log(
+        "开始整片擦除，仅擦除、不下载固件……".to_string(),
+    ));
+    emit(FlashEvent::Progress(FlashProgressUpdate {
+        operation: FlashOperation::Erase,
+        current: 0,
+        total: None,
+    }));
+
+    let erase_result = {
+        let mut progress = FlashProgress::new(|event| {
+            if let probe_rs::flashing::ProgressEvent::DiagnosticMessage { message } = event {
+                emit(FlashEvent::Log(format!("Flash 算法：{message}")));
+            }
+        });
+        erase_all(&mut session, &mut progress, false)
+    };
+    erase_result
+        .map_err(|error| format!("整片擦除失败：{error}\n请检查目标供电、调试接线及芯片型号。"))?;
+
+    emit(FlashEvent::Log("整片擦除完成。".to_string()));
+    Ok(EraseOutcome {
+        target: attached_target,
+        elapsed: started.elapsed(),
     })
 }
 

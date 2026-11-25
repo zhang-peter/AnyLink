@@ -19,6 +19,7 @@ fn main() -> Result<(), String> {
         hex_path: hex.into(),
         verify: true,
         chip_erase: std::env::var_os("ANYLINK_CHIP_ERASE").is_some(),
+        reset_after_flash: std::env::var_os("ANYLINK_RESET_AFTER_FLASH").is_some(),
     };
 
     let mut last_operation = None;

@@ -3,6 +3,41 @@
 All notable changes to AnyLink are recorded here. The application version is
 read from `Cargo.toml` and shown in the window and Windows file properties.
 
+## [0.4.1] - 2026-11-25
+
+### Changed
+
+- "复位运行" is now enabled by default for new and pre-existing configurations
+  that do not yet contain the setting
+- The last selected firmware file path is restored on startup and logged
+- The last firmware directory is persisted separately so the file picker can
+  reopen there even if the previous file has moved
+
+## [0.4.0] - 2026-11-25
+
+### Added
+
+- "复位运行" / reset-and-run after a successful download, configurable and persisted
+- "仅整片擦除" action that mass-erases all nonvolatile memory without downloading
+- Confirmation step before the destructive erase-only action
+- `anylink-cli --erase-chip [target]` for hardware erase diagnostics
+- GUI progress/result feedback for erase-only operations
+
+### Changed
+
+- A successful download now explicitly reports whether the target was reset and
+  left running or remains paused
+- The erase-only operation and the download operation share busy state and are
+  mutually exclusive
+
+### Verified
+
+- Real erase-only operation on an STM32G491RE; start and end of the 512 KiB flash
+  both read back as erased (`FF`)
+- Real download with reset-after-flash on the same target; core status read back
+  independently as `Running`
+- Confirmation UI for the destructive erase-only action
+
 ## [0.3.1] - 2026-11-25
 
 ### Fixed

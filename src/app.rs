@@ -26,6 +26,7 @@ enum UiEvent {
     Targets(Vec<String>),
     Flash(FlashEvent),
     FlashFinished(Result<FlashOutcome, String>),
+    EraseFinished(Result<backend::EraseOutcome, String>),
 }
 
 pub struct AnyLinkApp {
@@ -40,6 +41,9 @@ pub struct AnyLinkApp {
     choosing_file: bool,
     verify: bool,
     chip_erase: bool,
+    reset_after_flash: bool,
+    confirm_chip_erase: bool,
+    erasing: bool,
     busy: bool,
     progress_percent: f32,
     progress_total: Option<u64>,
@@ -67,6 +71,14 @@ impl AnyLinkApp {
             .searchable(true)
         });
 
+        let initial_logs = match config.last_hex.as_ref() {
+            Some(path) => vec![
+                "AnyLink 已启动，正在初始化……".to_string(),
+                format!("已恢复上次固件：{}", path.display()),
+            ],
+            None => vec!["AnyLink 已启动，正在初始化……".to_string()],
+        };
+
         let (sender, receiver) = async_channel::unbounded();
         let mut app = Self {
             probes: Vec::new(),
@@ -80,11 +92,14 @@ impl AnyLinkApp {
             choosing_file: false,
             verify: config.verify,
             chip_erase: config.chip_erase,
+            reset_after_flash: config.reset_after_flash,
+            confirm_chip_erase: false,
+            erasing: false,
             busy: false,
             progress_percent: 0.0,
             progress_total: None,
             progress_label: "准备中".to_string(),
-            logs: vec!["AnyLink 已启动，正在初始化……".to_string()],
+            logs: initial_logs,
             logs_open: false,
             result: None,
             config,
@@ -214,11 +229,12 @@ impl AnyLinkApp {
             },
             UiEvent::FlashFinished(result) => {
                 self.busy = false;
+                self.erasing = false;
                 self.progress_total = None;
                 match result {
                     Ok(outcome) => {
                         self.progress_percent = 100.0;
-                        self.progress_label = "完成".to_string();
+                        self.progress_label = "下载完成".to_string();
                         let verification = if outcome.dry_run {
                             "DRY RUN，无写入"
                         } else if outcome.verified {
@@ -231,19 +247,52 @@ impl AnyLinkApp {
                         } else {
                             "扇区擦除"
                         };
+                        let run_mode = if outcome.reset_after_flash {
+                            " · 已复位运行"
+                        } else {
+                            ""
+                        };
                         let message = format!(
-                            "{} · {} · {} · {} · {} ms",
+                            "{} · {} · {} · {} · {} ms{}",
                             outcome.target,
                             erase_mode,
                             verification,
                             format_bytes(outcome.file_size),
-                            outcome.elapsed.as_millis()
+                            outcome.elapsed.as_millis(),
+                            run_mode
                         );
                         self.logs.push(format!("下载完成：{message}"));
                         self.result = Some(Ok(message));
                     }
                     Err(error) => {
                         self.progress_total = None;
+                        self.progress_label = "下载失败".to_string();
+                        self.logs.push(error.clone());
+                        self.logs_open = true;
+                        self.result = Some(Err(error));
+                    }
+                }
+                self.trim_logs();
+                cx.notify();
+            }
+            UiEvent::EraseFinished(result) => {
+                self.busy = false;
+                self.erasing = false;
+                self.progress_total = None;
+                match result {
+                    Ok(outcome) => {
+                        self.progress_percent = 100.0;
+                        self.progress_label = "整片擦除完成".to_string();
+                        let message = format!(
+                            "{} · 整片擦除完成 · {} ms",
+                            outcome.target,
+                            outcome.elapsed.as_millis()
+                        );
+                        self.logs.push(message.clone());
+                        self.result = Some(Ok(message));
+                    }
+                    Err(error) => {
+                        self.progress_label = "整片擦除失败".to_string();
                         self.logs.push(error.clone());
                         self.logs_open = true;
                         self.result = Some(Err(error));
@@ -298,9 +347,19 @@ impl AnyLinkApp {
             .add_filter("Intel HEX 固件", &["hex"])
             .set_title("选择 Intel HEX 固件")
             .set_parent(window);
-        if let Some(directory) = self.hex_path.as_ref().and_then(|path| path.parent())
-            && directory.is_dir()
-        {
+
+        let directory = self
+            .hex_path
+            .as_ref()
+            .and_then(|path| path.parent())
+            .filter(|directory| directory.is_dir())
+            .or_else(|| {
+                self.config
+                    .last_hex_dir
+                    .as_deref()
+                    .filter(|directory| directory.is_dir())
+            });
+        if let Some(directory) = directory {
             dialog = dialog.set_directory(directory);
         }
 
@@ -325,6 +384,9 @@ impl AnyLinkApp {
             Ok(size) => {
                 self.hex_path = Some(path.clone());
                 self.config.last_hex = Some(path.clone());
+                if let Some(parent) = path.parent() {
+                    self.config.last_hex_dir = Some(parent.to_path_buf());
+                }
                 self.result = None;
                 self.logs.push(format!(
                     "已选择 HEX：{}（{}）",
@@ -351,8 +413,12 @@ impl AnyLinkApp {
         }
         self.config.last_probe = self.selected_probe.clone();
         self.config.last_hex = self.hex_path.clone();
+        if let Some(parent) = self.hex_path.as_ref().and_then(|path| path.parent()) {
+            self.config.last_hex_dir = Some(parent.to_path_buf());
+        }
         self.config.verify = self.verify;
         self.config.chip_erase = self.chip_erase;
+        self.config.reset_after_flash = self.reset_after_flash;
         if let Err(error) = config::save_config(&self.config) {
             self.logs.push(format!("保存配置失败：{error}"));
         }
@@ -379,6 +445,49 @@ impl AnyLinkApp {
             && self.hex_is_ready()
     }
 
+    fn can_erase_chip(&self, cx: &Context<Self>) -> bool {
+        !self.busy && self.selected_probe.is_some() && !self.target_value(cx).is_empty()
+    }
+
+    fn start_chip_erase(&mut self, cx: &mut Context<Self>) {
+        if !self.can_erase_chip(cx) {
+            self.result = Some(Err("请先选择调试器和目标芯片。".to_string()));
+            cx.notify();
+            return;
+        }
+
+        let Some(probe) = self.selected_probe.clone() else {
+            return;
+        };
+        let request = backend::EraseRequest {
+            probe,
+            target: self.target_value(cx),
+        };
+
+        self.confirm_chip_erase = false;
+        self.busy = true;
+        self.erasing = true;
+        self.result = None;
+        self.logs_open = false;
+        self.progress_percent = 0.0;
+        self.progress_total = None;
+        self.progress_label = "整片擦除中".to_string();
+        self.logs.push(format!(
+            "开始仅整片擦除：{}（不会下载固件）",
+            request.target
+        ));
+
+        let sender = self.sender.clone();
+        std::thread::spawn(move || {
+            let mut emit = |event| {
+                let _ = sender.send_blocking(UiEvent::Flash(event));
+            };
+            let result = backend::erase_chip(&request, &mut emit);
+            let _ = sender.send_blocking(UiEvent::EraseFinished(result));
+        });
+        cx.notify();
+    }
+
     fn start_flash(&mut self, cx: &mut Context<Self>) {
         if !self.can_download(cx) {
             self.result = Some(Err(
@@ -401,9 +510,12 @@ impl AnyLinkApp {
             hex_path,
             verify: self.verify,
             chip_erase: self.chip_erase,
+            reset_after_flash: self.reset_after_flash,
         };
+        self.confirm_chip_erase = false;
 
         self.busy = true;
+        self.erasing = false;
         self.result = None;
         self.logs_open = false;
         self.progress_percent = 0.0;
@@ -621,6 +733,9 @@ impl AnyLinkApp {
                         div()
                             .flex_1()
                             .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis_middle()
                             .p_2()
                             .rounded_md()
                             .border_1()
@@ -653,11 +768,7 @@ impl AnyLinkApp {
                 h_flex()
                     .justify_between()
                     .items_center()
-                    .child(div().text_sm().child(if self.busy {
-                        self.progress_label.clone()
-                    } else {
-                        "下载完成".to_string()
-                    }))
+                    .child(div().text_sm().child(self.progress_label.clone()))
                     .child(
                         div()
                             .text_xs()
@@ -680,7 +791,9 @@ impl AnyLinkApp {
 impl Render for AnyLinkApp {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let can_download = self.can_download(cx);
+        let can_erase = self.can_erase_chip(cx);
         let busy = self.busy;
+        let erasing = self.erasing;
         let result = self.result.clone();
         let logs = self.logs.join("\n");
         let dry_run = std::env::var_os("ANYLINK_DRY_RUN").is_some();
@@ -801,6 +914,19 @@ impl Render for AnyLinkApp {
                                                             cx.notify();
                                                         },
                                                     )),
+                                            )
+                                            .child(
+                                                Checkbox::new("reset-after-flash")
+                                                    .label("下载后复位运行")
+                                                    .checked(self.reset_after_flash)
+                                                    .disabled(busy)
+                                                    .on_change(cx.listener(
+                                                        |this, checked, _, cx| {
+                                                            this.reset_after_flash = *checked;
+                                                            this.persist_current_settings(cx);
+                                                            cx.notify();
+                                                        },
+                                                    )),
                                             ),
                                     )
                                     .when(self.chip_erase, |element| {
@@ -815,19 +941,81 @@ impl Render for AnyLinkApp {
                                     }),
                             )
                             .child(
-                                Button::new("download")
-                                    .primary()
-                                    .large()
-                                    .label(if busy {
-                                        "正在下载……"
-                                    } else {
-                                        "一键下载"
-                                    })
-                                    .loading(busy)
-                                    .disabled(!can_download)
-                                    .on_click(cx.listener(|this, _, _, cx| this.start_flash(cx))),
+                                h_flex()
+                                    .gap_2()
+                                    .child(
+                                        Button::new("erase-chip-only")
+                                            .danger()
+                                            .outline()
+                                            .large()
+                                            .label(if erasing {
+                                                "正在擦除……"
+                                            } else {
+                                                "仅整片擦除"
+                                            })
+                                            .loading(erasing)
+                                            .disabled(!can_erase)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.confirm_chip_erase = true;
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("download")
+                                            .primary()
+                                            .large()
+                                            .label(if busy && !erasing {
+                                                "正在下载……"
+                                            } else {
+                                                "一键下载"
+                                            })
+                                            .loading(busy && !erasing)
+                                            .disabled(!can_download)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.start_flash(cx)
+                                            })),
+                                    ),
                             ),
                     )
+                    .when(self.confirm_chip_erase, |element| {
+                        element.child(
+                            v_flex()
+                                .gap_3()
+                                .p_4()
+                                .rounded_lg()
+                                .border_1()
+                                .border_color(cx.theme().red)
+                                .bg(cx.theme().secondary)
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(cx.theme().red)
+                                        .child(
+                                            "确认仅整片擦除？该操作会删除目标芯片全部 Flash，且不会下载固件。",
+                                        ),
+                                )
+                                .child(
+                                    h_flex()
+                                        .gap_2()
+                                        .child(
+                                            Button::new("confirm-erase-chip")
+                                                .danger()
+                                                .label("确认整片擦除")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.start_chip_erase(cx)
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("cancel-erase-chip")
+                                                .label("取消")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.confirm_chip_erase = false;
+                                                    cx.notify();
+                                                })),
+                                        ),
+                                ),
+                        )
+                    })
                     .when(busy || result.is_some(), |element| {
                         element.child(
                             v_flex()

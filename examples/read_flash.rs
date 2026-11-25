@@ -17,6 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut session = probe.attach(target.as_str(), Permissions::default())?;
     let attached_target = session.target().name.clone();
     let mut core = session.core(0)?;
+    println!("core-status={:?}", core.status()?);
 
     let mut data = vec![0_u8; length];
     core.read_8(address, &mut data)?;

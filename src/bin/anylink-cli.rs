@@ -1,4 +1,4 @@
-use anylink::backend::{self, FlashEvent, FlashRequest};
+use anylink::backend::{self, EraseRequest, FlashEvent, FlashRequest};
 use anylink::{APP_NAME, APP_VERSION};
 
 fn main() {
@@ -36,16 +36,51 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Some("--erase-chip") => {
+            let target = args.get(2).map(String::as_str).unwrap_or("STM32H743ZI");
+            if let Err(error) = run_chip_erase(target) {
+                eprintln!("整片擦除失败：{error}");
+                std::process::exit(1);
+            }
+        }
         _ => {
             eprintln!("AnyLink CLI {APP_VERSION}");
             eprintln!("用法：");
             eprintln!("  anylink-cli --check [target]");
             eprintln!("  anylink-cli --dry-run <firmware.hex> [target]");
             eprintln!("  anylink-cli --validate-hex <firmware.hex>");
+            eprintln!("  anylink-cli --erase-chip [target]");
             eprintln!("  anylink-cli --version");
             std::process::exit(2);
         }
     }
+}
+
+fn run_chip_erase(target: &str) -> Result<(), String> {
+    println!("AnyLink 整片擦除（仅擦除，不下载）");
+    let probes = backend::list_supported_probes()?;
+    let probe = probes
+        .first()
+        .ok_or_else(|| "未检测到 DAP-Link / ST-Link".to_string())?;
+    println!("调试器：{} [{}]", probe.name, probe.detail());
+    println!("目标芯片：{target}");
+
+    let request = EraseRequest {
+        probe: probe.key.clone(),
+        target: target.to_string(),
+    };
+    let mut emit = |event| {
+        if let FlashEvent::Log(message) = event {
+            println!("{message}");
+        }
+    };
+    let outcome = backend::erase_chip(&request, &mut emit)?;
+    println!(
+        "整片擦除完成：{} · {:.2}s",
+        outcome.target,
+        outcome.elapsed.as_secs_f64()
+    );
+    Ok(())
 }
 
 fn run_hex_validation(hex: &str) -> Result<(), String> {
@@ -101,6 +136,7 @@ fn run_flash_dry_run(hex: &str, target: &str) -> Result<(), String> {
         hex_path: hex.into(),
         verify: true,
         chip_erase: false,
+        reset_after_flash: false,
     };
     let mut report_progress = |event| match event {
         FlashEvent::Log(message) => println!("{message}"),
