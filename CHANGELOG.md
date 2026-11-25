@@ -3,6 +3,41 @@
 All notable changes to AnyLink are recorded here. The application version is
 read from `Cargo.toml` and shown in the window and Windows file properties.
 
+## [0.3.1] - 2026-11-25
+
+### Fixed
+
+- HEX files using double-CR line endings (`\r\r\n`), blank lines between records,
+  leading/trailing whitespace, or a UTF-8 BOM no longer fail with
+  `Failed to read or decode the IHEX file`
+- HEX parsing now happens before the debug probe is opened, so file errors are
+  reported without requiring a target connection
+
+### Added
+
+- `anylink-cli --validate-hex <firmware.hex>` for hardware-independent HEX validation
+- Parse/download summary includes HEX record count, data bytes, and address range
+- Regression test for tolerant HEX line normalization
+
+## [0.3.0] - 2026-11-25
+
+### Added
+
+- Optional full-chip erase (`do_chip_erase`) with a destructive-operation warning
+- ST-Link / ST-Link V2/V2-1/V3 support through the probe-rs ST-Link driver
+- Probe cards now distinguish DAP-Link / CMSIS-DAP and ST-Link families
+
+### Changed
+
+- The probe scanner now lists all supported CMSIS-DAP and ST-Link probes
+- Download results and logs include the selected erase mode
+- Full-chip erase is persisted with the other application settings
+
+### Verified
+
+- Real full-chip erase, programming, and verification on an STM32H743ZI test board
+- Flash tail at `0x081FFF00` reads back as erased (`FF`) after full-chip erase
+
 ## [0.2.0] - 2026-11-25
 
 ### Added

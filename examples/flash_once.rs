@@ -7,10 +7,10 @@ fn main() -> Result<(), String> {
         .ok_or_else(|| "usage: flash_once <firmware.hex> [target]".to_string())?;
     let target = args.next().unwrap_or_else(|| "STM32H743ZI".to_string());
 
-    let probes = backend::list_daplink_probes()?;
+    let probes = backend::list_supported_probes()?;
     let probe = probes
         .first()
-        .ok_or_else(|| "no DAP-Link / CMSIS-DAP probe found".to_string())?;
+        .ok_or_else(|| "no DAP-Link / ST-Link probe found".to_string())?;
     println!("probe={} [{}]", probe.name, probe.detail());
 
     let request = FlashRequest {
@@ -18,6 +18,7 @@ fn main() -> Result<(), String> {
         target,
         hex_path: hex.into(),
         verify: true,
+        chip_erase: std::env::var_os("ANYLINK_CHIP_ERASE").is_some(),
     };
 
     let mut last_operation = None;

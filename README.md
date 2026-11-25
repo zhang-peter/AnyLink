@@ -1,17 +1,20 @@
 # AnyLink
 
-基于 Rust、GPUI Fast / GPUI Kit 和 probe-rs 的 DAP-Link 固件下载工具。
+基于 Rust、GPUI Fast / GPUI Kit 和 probe-rs 的 DAP-Link / ST-Link 固件下载工具。
 
 当前版本面向 Windows，支持：
 
-- 检测并选择 DAP-Link / CMSIS-DAP 调试器
+- 检测并选择 DAP-Link / CMSIS-DAP 或 ST-Link / ST-Link V2/V2-1/V3 调试器
 - 通过可搜索下拉框选择 probe-rs 目标芯片，输入内容仅用于快速过滤
 - 只显示 `.hex` 文件的固件选择对话框
-- 擦除必要 Flash 扇区、写入并可选回读校验
+- 兼容含空行、异常 CR 换行、BOM 或行首尾空格的 Intel HEX 文件
+- 下载前先校验 HEX 记录和地址范围，再连接调试器
+- 默认擦除固件覆盖的必要 Flash 扇区，也可选择整片擦除
+- 写入并可选回读校验
 - 后台执行下载，界面保持响应
 - 显示阶段、进度、日志和可操作的错误信息
 - 页面内容超过窗口高度时自动滚动
-- 记住上次调试器、芯片和 HEX 文件
+- 记住上次调试器、芯片、HEX 文件和擦除选项
 - 独立版本号与 Windows 文件版本信息
 
 ![AnyLink 界面](docs/screenshot.png)
@@ -20,7 +23,7 @@
 
 - Windows 10 / 11 x64
 - Rust stable（本项目使用 Rust 1.98）
-- DAP-Link（CMSIS-DAP v1 或 v2）
+- DAP-Link（CMSIS-DAP v1 或 v2）或 ST-Link
 - 已连接且供电正常的目标板
 
 ## 构建和运行
@@ -38,7 +41,7 @@ cargo run --release
 生成文件：
 
 ```text
-dist/AnyLink-v0.2.0-Windows-x64.zip
+dist/AnyLink-v0.3.1-Windows-x64.zip
 ```
 
 发布目录同时包含 GUI 程序 `anylink.exe` 和不打开窗口的诊断工具
@@ -46,11 +49,14 @@ dist/AnyLink-v0.2.0-Windows-x64.zip
 
 ## 使用方法
 
-1. 连接 DAP-Link 和目标板。
-2. 启动 AnyLink，点击“刷新设备”并选择 DAP-Link。
+1. 连接 DAP-Link / ST-Link 和目标板。
+2. 启动 AnyLink，点击“刷新设备”并选择调试器。
 3. 打开“目标芯片”下拉框，输入 `STM32H743ZI` 快速过滤，然后点击匹配项。
 4. 点击“浏览…”选择 `.hex` 固件，文件选择器会过滤非 HEX 文件。
-5. 保持“下载后回读校验”开启，点击“一键下载”。
+5. 根据需求选择“下载后回读校验”和“整片擦除”。
+6. 点击“一键下载”。
+
+“整片擦除”会删除目标芯片全部 Flash，包括固件未覆盖的区域，默认关闭。启用后界面会显示红色警告。
 
 配置保存在：
 
@@ -72,6 +78,12 @@ target\release\anylink-cli.exe --check STM32H743ZI
 
 ```powershell
 target\release\anylink-cli.exe --dry-run examples\dry-run-demo.hex STM32H743ZI
+```
+
+仅校验 HEX 文件，不连接任何硬件：
+
+```powershell
+target\release\anylink-cli.exe --validate-hex .\RX_RECOVERY_BL_APP.hex
 ```
 
 查看版本：
@@ -102,7 +114,7 @@ src/
 ├── app.rs               # GPUI 页面、状态机、后台任务和进度更新
 ├── config.rs            # 配置读写
 └── backend/
-    └── mod.rs           # DAP-Link 枚举、芯片解析、HEX 下载和校验
+    └── mod.rs           # DAP-Link / ST-Link 枚举、芯片解析、擦除和下载
 assets/
 ├── logo.png             # 界面 Logo
 └── logo.ico             # Windows 程序图标
@@ -137,10 +149,10 @@ examples/
 ```text
 GPUI 按钮
   └─ 独立工作线程
-       ├─ 枚举并打开指定 DAP-Link
+       ├─ 枚举并打开指定 DAP-Link / ST-Link
        ├─ attach 目标芯片
        ├─ 解析 Intel HEX
-       ├─ 擦除所需 Flash 扇区
+       ├─ 擦除所需 Flash 扇区或整片擦除
        ├─ 写入
        ├─ 可选校验
        └─ 通过异步 channel 更新进度和最终结果
@@ -149,8 +161,8 @@ GPUI 按钮
 默认下载选项：
 
 - `verify = true`：下载后回读校验
-- `do_chip_erase = false`：不做全片擦除
-- 仅擦除固件覆盖范围所需的 Flash 扇区
+- `do_chip_erase = false`：默认只擦除固件覆盖范围所需的 Flash 扇区
+- 开启“整片擦除”后使用 `do_chip_erase = true`，优先调用芯片整片擦除功能
 - 失败时不继续执行校验或运行固件
 
 ## 已验证
@@ -160,12 +172,18 @@ GPUI 按钮
 - DAP-Link：`VID_0D28 / PID_0204`，CMSIS-DAP v2，序列号 `d2c384748294e2d101`
 - 目标：`STM32H743ZI`，Armv7-M
 - 已在明确允许擦写的测试板上完成真实 GUI 一键下载
-- 下载结果：`已写入并校验 · 767 B · 1973 ms`
+- 真实整片擦除、写入和校验完成，耗时约 24.7 秒
+- 整片擦除后，Flash 尾部 `0x081FFF00` 回读为全 `FF`
 - 独立回读 `0x08000000`：向量表为 `00 00 02 24 01 01 00 08`
 - 独立回读 `0x08000020`：测试标记 `CA FE BA BE`
 - 独立回读 `0x08000100`：复位处理 `FE E7`
 - HEX 不含目标 Flash 数据时会在擦除前拒绝下载
-- 8 个单元测试通过
+- `RX_RECOVERY_BL_APP.hex` 的异常双 CR/空行格式已成功校验：
+  - 16384 条数据记录
+  - 524288 字节
+  - 地址范围 `0x08000000–0x08080000`
+- ST-Link 驱动与设备枚举代码已编译通过；当前环境没有 ST-Link 硬件，尚未做真机验证
+- 10 个单元测试通过，包括 HEX 容错与 ST-Link / CMSIS-DAP 设备类型识别测试
 - `cargo clippy --all-targets -- -D warnings` 通过
 
 测试板当前运行最小 `B .` 循环固件，不初始化外设；如需恢复业务固件，直接使用原始 HEX 再次下载即可。
@@ -179,7 +197,7 @@ cargo run --example read_flash -- STM32H743ZI 0x08000000 48
 ## 首版限制
 
 - 仅支持 Intel HEX，不支持 ELF、BIN、UF2
-- 仅列出 DAP-Link / CMSIS-DAP，不支持 ST-Link、J-Link 等
+- 支持 DAP-Link / CMSIS-DAP 和 ST-Link，不支持 J-Link、FTDI 等其他调试器
 - 不自动猜测芯片型号，需要手动选择一次并记住
 - 不支持在线调试、RTT、固件取消、全片擦除或量产模式
 - probe-rs 内置目标库不支持的芯片暂不能下载

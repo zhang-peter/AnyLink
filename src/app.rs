@@ -39,6 +39,7 @@ pub struct AnyLinkApp {
     hex_path: Option<PathBuf>,
     choosing_file: bool,
     verify: bool,
+    chip_erase: bool,
     busy: bool,
     progress_percent: f32,
     progress_total: Option<u64>,
@@ -78,6 +79,7 @@ impl AnyLinkApp {
             hex_path: config.last_hex.clone(),
             choosing_file: false,
             verify: config.verify,
+            chip_erase: config.chip_erase,
             busy: false,
             progress_percent: 0.0,
             progress_total: None,
@@ -137,9 +139,9 @@ impl AnyLinkApp {
                 match result {
                     Ok(probes) => {
                         self.probe_message = if probes.is_empty() {
-                            "未检测到 DAP-Link / CMSIS-DAP，请连接设备后刷新".to_string()
+                            "未检测到 DAP-Link / ST-Link，请连接设备后刷新".to_string()
                         } else {
-                            format!("检测到 {} 个 DAP-Link / CMSIS-DAP", probes.len())
+                            format!("检测到 {} 个 DAP-Link / ST-Link", probes.len())
                         };
                         self.logs
                             .push(format!("刷新调试器：{}", self.probe_message));
@@ -224,9 +226,15 @@ impl AnyLinkApp {
                         } else {
                             "已写入，未校验"
                         };
+                        let erase_mode = if outcome.chip_erase {
+                            "整片擦除"
+                        } else {
+                            "扇区擦除"
+                        };
                         let message = format!(
-                            "{} · {} · {} · {} ms",
+                            "{} · {} · {} · {} · {} ms",
                             outcome.target,
+                            erase_mode,
                             verification,
                             format_bytes(outcome.file_size),
                             outcome.elapsed.as_millis()
@@ -255,7 +263,7 @@ impl AnyLinkApp {
         self.probe_message = "正在扫描 USB 调试器……".to_string();
         let sender = self.sender.clone();
         std::thread::spawn(move || {
-            let result = backend::list_daplink_probes();
+            let result = backend::list_supported_probes();
             let _ = sender.send_blocking(UiEvent::Probes(result));
         });
         cx.notify();
@@ -344,6 +352,7 @@ impl AnyLinkApp {
         self.config.last_probe = self.selected_probe.clone();
         self.config.last_hex = self.hex_path.clone();
         self.config.verify = self.verify;
+        self.config.chip_erase = self.chip_erase;
         if let Err(error) = config::save_config(&self.config) {
             self.logs.push(format!("保存配置失败：{error}"));
         }
@@ -391,6 +400,7 @@ impl AnyLinkApp {
             target: self.target_value(cx),
             hex_path,
             verify: self.verify,
+            chip_erase: self.chip_erase,
         };
 
         self.busy = true;
@@ -446,7 +456,7 @@ impl AnyLinkApp {
                                 div()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child("仅列出 DAP-Link / CMSIS-DAP 设备"),
+                                    .child("支持 DAP-Link / CMSIS-DAP 与 ST-Link 设备"),
                             ),
                     )
                     .child(
@@ -508,18 +518,29 @@ impl AnyLinkApp {
                                                 ),
                                         )
                                         .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(if is_selected {
-                                                    cx.theme().green
-                                                } else {
-                                                    cx.theme().muted_foreground
-                                                })
-                                                .child(if is_selected {
-                                                    "已选择"
-                                                } else {
-                                                    "点击选择"
-                                                }),
+                                            v_flex()
+                                                .items_end()
+                                                .gap_1()
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(cx.theme().muted_foreground)
+                                                        .child(probe.family_label()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(if is_selected {
+                                                            cx.theme().green
+                                                        } else {
+                                                            cx.theme().muted_foreground
+                                                        })
+                                                        .child(if is_selected {
+                                                            "已选择"
+                                                        } else {
+                                                            "点击选择"
+                                                        }),
+                                                ),
                                         ),
                                 )
                         })),
@@ -700,7 +721,9 @@ impl Render for AnyLinkApp {
                                                 div()
                                                     .text_sm()
                                                     .text_color(cx.theme().muted_foreground)
-                                                    .child("DAP-Link · STM32 · Intel HEX 固件下载"),
+                                                    .child(
+                                                        "DAP-Link / ST-Link · STM32 · Intel HEX 固件下载",
+                                                    ),
                                             ),
                                     ),
                             )
@@ -748,15 +771,48 @@ impl Render for AnyLinkApp {
                             .items_center()
                             .justify_between()
                             .child(
-                                Checkbox::new("verify")
-                                    .label("下载后回读校验")
-                                    .checked(self.verify)
-                                    .disabled(busy)
-                                    .on_change(cx.listener(|this, checked, _, cx| {
-                                        this.verify = *checked;
-                                        this.persist_current_settings(cx);
-                                        cx.notify();
-                                    })),
+                                v_flex()
+                                    .gap_1()
+                                    .child(
+                                        h_flex()
+                                            .gap_5()
+                                            .child(
+                                                Checkbox::new("verify")
+                                                    .label("下载后回读校验")
+                                                    .checked(self.verify)
+                                                    .disabled(busy)
+                                                    .on_change(cx.listener(
+                                                        |this, checked, _, cx| {
+                                                            this.verify = *checked;
+                                                            this.persist_current_settings(cx);
+                                                            cx.notify();
+                                                        },
+                                                    )),
+                                            )
+                                            .child(
+                                                Checkbox::new("chip-erase")
+                                                    .label("整片擦除")
+                                                    .checked(self.chip_erase)
+                                                    .disabled(busy)
+                                                    .on_change(cx.listener(
+                                                        |this, checked, _, cx| {
+                                                            this.chip_erase = *checked;
+                                                            this.persist_current_settings(cx);
+                                                            cx.notify();
+                                                        },
+                                                    )),
+                                            ),
+                                    )
+                                    .when(self.chip_erase, |element| {
+                                        element.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().red)
+                                                .child(
+                                                    "整片擦除会删除目标芯片全部 Flash，包括非固件区域。",
+                                                ),
+                                        )
+                                    }),
                             )
                             .child(
                                 Button::new("download")

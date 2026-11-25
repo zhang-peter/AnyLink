@@ -5,10 +5,15 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use probe_rs::Permissions;
+use probe_rs::Session;
 use probe_rs::config::Registry;
-use probe_rs::flashing::{DownloadOptions, FlashProgress, HexLoader, build_loader};
+use probe_rs::flashing::{
+    DownloadOptions, FileDownloadError, FlashLoader, FlashProgress, ImageLoader, ImageReader,
+    build_loader,
+};
 use probe_rs::probe::cmsisdap::CmsisDapFactory;
 use probe_rs::probe::list::Lister;
+use probe_rs::probe::stlink::StLinkFactory;
 use probe_rs::probe::{DebugProbeInfo, Probe};
 use serde::{Deserialize, Serialize};
 
@@ -48,11 +53,37 @@ impl ProbeKey {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeFamily {
+    CmsisDap,
+    StLink,
+}
+
+impl ProbeFamily {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::CmsisDap => "DAP-Link / CMSIS-DAP",
+            Self::StLink => "ST-Link",
+        }
+    }
+
+    fn from_info(info: &DebugProbeInfo) -> Option<Self> {
+        if info.is_probe_type::<CmsisDapFactory>() {
+            Some(Self::CmsisDap)
+        } else if info.is_probe_type::<StLinkFactory>() {
+            Some(Self::StLink)
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProbeDescriptor {
     pub key: ProbeKey,
     pub name: String,
     pub probe_type: String,
+    pub family: ProbeFamily,
 }
 
 impl ProbeDescriptor {
@@ -63,6 +94,10 @@ impl ProbeDescriptor {
             self.key.vendor_id, self.key.product_id, serial, self.probe_type
         )
     }
+
+    pub fn family_label(&self) -> &'static str {
+        self.family.label()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -71,6 +106,7 @@ pub struct FlashRequest {
     pub target: String,
     pub hex_path: PathBuf,
     pub verify: bool,
+    pub chip_erase: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,6 +169,7 @@ pub struct FlashOutcome {
     pub file: PathBuf,
     pub file_size: u64,
     pub verified: bool,
+    pub chip_erase: bool,
     pub elapsed: Duration,
     pub dry_run: bool,
 }
@@ -144,15 +181,27 @@ pub struct TargetInfo {
     pub cores: String,
 }
 
-pub fn list_daplink_probes() -> Result<Vec<ProbeDescriptor>, String> {
+#[derive(Clone, Debug)]
+pub struct HexInspection {
+    pub file_size: u64,
+    pub data_records: usize,
+    pub data_bytes: u64,
+    pub start_address: Option<u64>,
+    pub end_address: Option<u64>,
+}
+
+pub fn list_supported_probes() -> Result<Vec<ProbeDescriptor>, String> {
     let probes = list_raw_probes()?;
     Ok(probes
         .iter()
-        .filter(|info| info.is_probe_type::<CmsisDapFactory>())
-        .map(|info| ProbeDescriptor {
-            key: ProbeKey::from_info(info),
-            name: info.identifier.clone(),
-            probe_type: info.probe_type(),
+        .filter_map(|info| {
+            let family = ProbeFamily::from_info(info)?;
+            Some(ProbeDescriptor {
+                key: ProbeKey::from_info(info),
+                name: info.identifier.clone(),
+                probe_type: info.probe_type(),
+                family,
+            })
         })
         .collect())
 }
@@ -167,14 +216,14 @@ fn open_selected_probe(key: &ProbeKey) -> Result<Probe, String> {
     let probes = list_raw_probes()?;
     let info = probes
         .into_iter()
-        .filter(|info| info.is_probe_type::<CmsisDapFactory>())
+        .filter(|info| ProbeFamily::from_info(info).is_some())
         .find(|info| key.matches(info))
         .ok_or_else(|| {
-            "未找到之前选择的 DAP-Link。请确认设备已连接，并点击“刷新设备”。".to_string()
+            "未找到之前选择的调试器。请确认设备已连接，并点击“刷新设备”。".to_string()
         })?;
 
     info.open().map_err(|error| {
-        format!("无法打开 DAP-Link：{error}\n请关闭其他调试/下载工具，并重新插拔调试器。")
+        format!("无法打开调试器：{error}\n请关闭其他调试/下载工具，并重新插拔调试器。")
     })
 }
 
@@ -274,19 +323,140 @@ pub fn validate_hex_path(path: &Path) -> Result<u64, String> {
 
 /// Flash an Intel HEX file. `emit` receives log lines and progress updates.
 /// `dry_run` parses and lays out the image without erasing or programming.
+/// Parse and validate an Intel HEX file without connecting to hardware.
+///
+/// This accepts the same tolerant line-ending/blank-line input as the download
+/// path, so validation and flashing always agree about whether a file is valid.
+pub fn inspect_hex_file(path: &Path) -> Result<HexInspection, String> {
+    let file_size = validate_hex_path(path)?;
+    let bytes = std::fs::read(path).map_err(|error| format!("无法读取 HEX 文件：{error}"))?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|error| format!("HEX 文件不是有效的 UTF-8/ASCII 文本：{error}"))?;
+    let normalized = normalize_hex_text(text);
+
+    let mut base_address = 0_u64;
+    let mut data_records = 0;
+    let mut data_bytes = 0_u64;
+    let mut start_address: Option<u64> = None;
+    let mut end_address: Option<u64> = None;
+
+    for (index, record) in ihex::Reader::new(&normalized).enumerate() {
+        let record =
+            record.map_err(|error| format!("Intel HEX 记录 #{} 解析失败：{error}", index + 1))?;
+        match record {
+            ihex::Record::Data { offset, value } => {
+                let address = base_address + offset as u64;
+                data_records += 1;
+                data_bytes += value.len() as u64;
+                start_address = Some(start_address.map_or(address, |current| current.min(address)));
+                let end = address + value.len() as u64;
+                end_address = Some(end_address.map_or(end, |current| current.max(end)));
+            }
+            ihex::Record::ExtendedSegmentAddress(address) => {
+                base_address = (address as u64) * 16;
+            }
+            ihex::Record::ExtendedLinearAddress(address) => {
+                base_address = (address as u64) << 16;
+            }
+            ihex::Record::EndOfFile
+            | ihex::Record::StartSegmentAddress { .. }
+            | ihex::Record::StartLinearAddress(_) => {}
+        }
+    }
+
+    if data_records == 0 {
+        return Err("HEX 文件中没有可下载的数据记录。".to_string());
+    }
+
+    Ok(HexInspection {
+        file_size,
+        data_records,
+        data_bytes,
+        start_address,
+        end_address,
+    })
+}
+
+#[derive(Clone, Copy)]
+struct TolerantHexLoader;
+
+impl ImageLoader for TolerantHexLoader {
+    fn load(
+        &self,
+        flash_loader: &mut FlashLoader,
+        _session: &mut Session,
+        file: &mut dyn ImageReader,
+    ) -> Result<(), FileDownloadError> {
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        let text = std::str::from_utf8(&bytes).map_err(|error| {
+            FileDownloadError::ImageFormatSpecific {
+                format: "Intel HEX".to_string(),
+                source: Box::new(error),
+            }
+        })?;
+        let normalized = normalize_hex_text(text);
+        let mut base_address = 0_u64;
+
+        for record in ihex::Reader::new(&normalized) {
+            match record? {
+                ihex::Record::Data { offset, value } => {
+                    flash_loader.add_data(base_address + offset as u64, &value)?;
+                }
+                ihex::Record::ExtendedSegmentAddress(address) => {
+                    base_address = (address as u64) * 16;
+                }
+                ihex::Record::ExtendedLinearAddress(address) => {
+                    base_address = (address as u64) << 16;
+                }
+                ihex::Record::EndOfFile
+                | ihex::Record::StartSegmentAddress { .. }
+                | ihex::Record::StartLinearAddress(_) => {}
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn normalize_hex_text(text: &str) -> String {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut normalized = String::with_capacity(text.len());
+
+    for line in text.replace('\r', "\n").lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        normalized.push_str(line);
+        normalized.push('\n');
+    }
+
+    normalized
+}
+
 pub fn flash_hex(
     request: &FlashRequest,
     dry_run: bool,
     emit: &mut impl FnMut(FlashEvent),
 ) -> Result<FlashOutcome, String> {
     let started = Instant::now();
-    let file_size = validate_hex_path(&request.hex_path)?;
+    let inspection = inspect_hex_file(&request.hex_path)?;
+    let file_size = inspection.file_size;
     let target = resolve_target(&request.target)?;
 
     emit(FlashEvent::Log(format!(
         "HEX 文件：{}（{} 字节）",
         request.hex_path.display(),
         file_size
+    )));
+    let address_range = match (inspection.start_address, inspection.end_address) {
+        (Some(start), Some(end)) => format!("{start:#010X}–{end:#010X}"),
+        _ => "未知".to_string(),
+    };
+    emit(FlashEvent::Log(format!(
+        "HEX 校验通过：{} 条数据记录，{} 字节，地址 {}",
+        inspection.data_records, inspection.data_bytes, address_range
     )));
     emit(FlashEvent::Log(format!("目标芯片：{target}")));
 
@@ -303,7 +473,7 @@ pub fn flash_hex(
         session.architecture()
     )));
 
-    let loader = build_loader(&mut session, &request.hex_path, HexLoader, None)
+    let loader = build_loader(&mut session, &request.hex_path, TolerantHexLoader, None)
         .map_err(|error| format!("解析 HEX 失败：{error}"))?;
     let nvm_ranges: Vec<Range<u64>> = session
         .target()
@@ -326,6 +496,11 @@ pub fn flash_hex(
         "HEX 中有 {flash_bytes} 字节位于目标 Flash"
     )));
 
+    emit(FlashEvent::Log(if request.chip_erase {
+        "擦除模式：整片擦除（将删除目标芯片全部 Flash）".to_string()
+    } else {
+        "擦除模式：仅擦除固件覆盖的必要 Flash 扇区".to_string()
+    }));
     emit(FlashEvent::Log(if dry_run {
         "开始 DRY RUN：只解析固件并检查 Flash 布局，不擦除、不写入。".to_string()
     } else {
@@ -335,7 +510,7 @@ pub fn flash_hex(
     let download_result = {
         let mut options = DownloadOptions::default();
         options.verify = request.verify && !dry_run;
-        options.do_chip_erase = false;
+        options.do_chip_erase = request.chip_erase;
         options.keep_unwritten_bytes = false;
         options.dry_run = dry_run;
 
@@ -446,6 +621,7 @@ pub fn flash_hex(
         file: request.hex_path.clone(),
         file_size,
         verified,
+        chip_erase: request.chip_erase,
         elapsed: started.elapsed(),
         dry_run,
     })
@@ -510,6 +686,47 @@ mod tests {
 
         let missing = Path::new("definitely-missing-firmware.hex");
         assert!(validate_hex_path(missing).unwrap_err().contains("无法读取"));
+    }
+
+    #[test]
+    fn normalizes_double_cr_blank_lines_and_bom() {
+        let input =
+            "\u{feff}:020000040800F2\r\r\n\r\n  :0400000000000224D6  \r\r\n\r\n:00000001FF\r\r\n";
+        let normalized = normalize_hex_text(input);
+        assert_eq!(
+            normalized,
+            ":020000040800F2\n:0400000000000224D6\n:00000001FF\n"
+        );
+
+        let records: Vec<ihex::Record> = ihex::Reader::new(&normalized)
+            .collect::<Result<_, _>>()
+            .expect("normalized records parse");
+        assert_eq!(records.len(), 3);
+    }
+
+    #[test]
+    fn recognizes_cmsis_dap_and_stlink_probe_families() {
+        let cmsis = DebugProbeInfo::new(
+            "DAPLink CMSIS-DAP",
+            0x0D28,
+            0x0204,
+            Some("dap-serial".to_string()),
+            &CmsisDapFactory,
+            Some(3),
+            false,
+        );
+        let stlink = DebugProbeInfo::new(
+            "ST-Link V3",
+            0x0483,
+            0x374E,
+            Some("stlink-serial".to_string()),
+            &StLinkFactory,
+            None,
+            false,
+        );
+
+        assert_eq!(ProbeFamily::from_info(&cmsis), Some(ProbeFamily::CmsisDap));
+        assert_eq!(ProbeFamily::from_info(&stlink), Some(ProbeFamily::StLink));
     }
 
     #[test]

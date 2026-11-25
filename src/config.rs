@@ -14,6 +14,8 @@ pub struct AppConfig {
     pub last_hex: Option<PathBuf>,
     #[serde(default = "default_verify")]
     pub verify: bool,
+    #[serde(default)]
+    pub chip_erase: bool,
 }
 
 impl Default for AppConfig {
@@ -23,6 +25,7 @@ impl Default for AppConfig {
             last_target: String::new(),
             last_hex: None,
             verify: true,
+            chip_erase: false,
         }
     }
 }
@@ -77,6 +80,7 @@ mod tests {
         let config = load_config_from(&path);
         assert_eq!(config, AppConfig::default());
         assert!(config.verify);
+        assert!(!config.chip_erase);
     }
 
     #[test]
@@ -93,6 +97,7 @@ mod tests {
             last_target: "STM32H743ZI".to_string(),
             last_hex: Some(PathBuf::from("C:/firmware/demo.hex")),
             verify: false,
+            chip_erase: true,
         };
 
         save_config_to(&path, &config).expect("write config");

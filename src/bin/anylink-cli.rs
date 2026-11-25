@@ -26,22 +26,49 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Some("--validate-hex") => {
+            let Some(hex) = args.get(2) else {
+                eprintln!("用法：anylink-cli --validate-hex <firmware.hex>");
+                std::process::exit(2);
+            };
+            if let Err(error) = run_hex_validation(hex) {
+                eprintln!("HEX 校验失败：{error}");
+                std::process::exit(1);
+            }
+        }
         _ => {
             eprintln!("AnyLink CLI {APP_VERSION}");
             eprintln!("用法：");
             eprintln!("  anylink-cli --check [target]");
             eprintln!("  anylink-cli --dry-run <firmware.hex> [target]");
+            eprintln!("  anylink-cli --validate-hex <firmware.hex>");
             eprintln!("  anylink-cli --version");
             std::process::exit(2);
         }
     }
 }
 
+fn run_hex_validation(hex: &str) -> Result<(), String> {
+    let info = backend::inspect_hex_file(hex.as_ref())?;
+    println!("HEX 文件：{hex}");
+    println!("文件大小：{} 字节", info.file_size);
+    println!("数据记录：{} 条", info.data_records);
+    println!("数据字节：{} 字节", info.data_bytes);
+    match (info.start_address, info.end_address) {
+        (Some(start), Some(end)) => {
+            println!("地址范围：{start:#010X}–{end:#010X}");
+        }
+        _ => println!("地址范围：未知"),
+    }
+    println!("HEX 校验通过。");
+    Ok(())
+}
+
 fn run_hardware_check(target: &str) -> Result<(), String> {
     println!("AnyLink 硬件检查（只读，不擦写 Flash）");
-    let probes = backend::list_daplink_probes()?;
+    let probes = backend::list_supported_probes()?;
     if probes.is_empty() {
-        return Err("未检测到 DAP-Link / CMSIS-DAP".to_string());
+        return Err("未检测到 DAP-Link / ST-Link".to_string());
     }
 
     for probe in &probes {
@@ -50,7 +77,7 @@ fn run_hardware_check(target: &str) -> Result<(), String> {
 
     let probe = probes
         .first()
-        .ok_or_else(|| "未检测到 DAP-Link / CMSIS-DAP".to_string())?;
+        .ok_or_else(|| "未检测到 DAP-Link / ST-Link".to_string())?;
     println!("连接目标：{target}");
     let info = backend::identify_target(&probe.key, target)?;
     println!("目标：{}", info.target);
@@ -62,10 +89,10 @@ fn run_hardware_check(target: &str) -> Result<(), String> {
 
 fn run_flash_dry_run(hex: &str, target: &str) -> Result<(), String> {
     println!("AnyLink Flash DRY RUN（不擦除、不写入）");
-    let probes = backend::list_daplink_probes()?;
+    let probes = backend::list_supported_probes()?;
     let probe = probes
         .first()
-        .ok_or_else(|| "未检测到 DAP-Link / CMSIS-DAP".to_string())?;
+        .ok_or_else(|| "未检测到 DAP-Link / ST-Link".to_string())?;
     println!("调试器：{} [{}]", probe.name, probe.detail());
 
     let request = FlashRequest {
@@ -73,6 +100,7 @@ fn run_flash_dry_run(hex: &str, target: &str) -> Result<(), String> {
         target: target.to_string(),
         hex_path: hex.into(),
         verify: true,
+        chip_erase: false,
     };
     let mut report_progress = |event| match event {
         FlashEvent::Log(message) => println!("{message}"),
