@@ -1,0 +1,18 @@
+# Rust build output
+/target/
+
+# Generated release packages and test captures
+/dist/
+/artifacts/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Local OS and log files
+.DS_Store
+Thumbs.db
+*.log
